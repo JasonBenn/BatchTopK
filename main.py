@@ -1,8 +1,8 @@
 #%%
-from training import train_sae, train_sae_group
-from sae import VanillaSAE, TopKSAE, BatchTopKSAE, JumpReLUSAE
-from activation_store import ActivationsStore
-from config import get_default_cfg, post_init_cfg
+from batchtopk.training import train_sae, train_sae_group
+from batchtopk.sae import VanillaSAE, TopKSAE, BatchTopKSAE, JumpReLUSAE
+from batchtopk.activation_store import ActivationsStore
+from batchtopk.config import get_default_cfg, post_init_cfg
 from transformer_lens import HookedTransformer
 
 
