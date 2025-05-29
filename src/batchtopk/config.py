@@ -1,4 +1,8 @@
-import transformer_lens.utils as utils
+try:
+    import transformer_lens.utils as utils
+    HAS_TRANSFORMER_LENS = True
+except ImportError:
+    HAS_TRANSFORMER_LENS = False
 import torch 
 
 def get_default_cfg():
@@ -40,6 +44,10 @@ def get_default_cfg():
     return default_cfg
 
 def post_init_cfg(cfg):
-    cfg["hook_point"] = utils.get_act_name(cfg["site"], cfg["layer"])
+    if HAS_TRANSFORMER_LENS:
+        cfg["hook_point"] = utils.get_act_name(cfg["site"], cfg["layer"])
+    else:
+        # Fallback for when transformer_lens is not available
+        cfg["hook_point"] = f"{cfg['site']}.{cfg['layer']}"
     cfg["name"] = f"{cfg['model_name']}_{cfg['hook_point']}_{cfg['dict_size']}_{cfg['sae_type']}_{cfg['top_k']}_{cfg['lr']}"
     return cfg

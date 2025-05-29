@@ -1,6 +1,6 @@
 import torch
 import tqdm
-from logs import init_wandb, log_wandb, log_model_performance, save_checkpoint
+from .logs import init_wandb, log_wandb, log_model_performance, save_checkpoint
 
 def train_sae(sae, activation_store, model, cfg):
     num_batches = cfg["num_tokens"] // cfg["batch_size"]

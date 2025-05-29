@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.autograd as autograd
+import einops
+import numpy as np
+from typing import Optional, Tuple
 
 
 class BaseAutoencoder(nn.Module):
@@ -339,3 +342,175 @@ class JumpReLUSAE(BaseAutoencoder):
             "l1_norm": l0,
         }
         return output
+
+
+class BatchTopKCrossCoder(nn.Module):
+    """BatchTopK CrossCoder for model diffing between two models.
+    
+    This is a sparse autoencoder that learns to represent activations from two different
+    models (e.g., base and fine-tuned) using a shared dictionary with batch-wise TopK
+    sparsity. It uses the BatchTopK activation function where:
+    1. All feature activations across the batch are flattened
+    2. The top (K * batch_size) activations are selected
+    3. Activations are reshaped back to the original batch shape
+    
+    Args:
+        cfg: Configuration dict with the following keys:
+            - act_size (int): Size of input activations (D)
+            - dict_size (int): Size of the sparse dictionary (H)
+            - top_k (int): Number of active features per example
+            - device (str): Device to run on
+            - dtype (torch.dtype): Data type to use
+            - seed (int): Random seed
+            - dec_init_norm (float): Initial norm for decoder weights
+            - aux_penalty (float): Auxiliary loss penalty
+            - top_k_aux (int): Top-k for auxiliary loss
+            - n_batches_to_dead (int): Batches before feature considered dead
+    """
+    
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.H = cfg["dict_size"]
+        self.D = cfg["act_size"]
+        self.k = cfg["top_k"]
+        
+        torch.manual_seed(cfg["seed"])
+        
+        # Encoder and decoder weights for 2 models
+        self.W_dec_H2D = nn.Parameter(
+            torch.nn.init.kaiming_uniform_(
+                torch.empty(self.H, 2, self.D, dtype=cfg["dtype"])
+            )
+        )
+        # Initialize decoder norms
+        dec_init_norm = cfg.get("dec_init_norm", 0.08)
+        self.W_dec_H2D.data = (
+            self.W_dec_H2D.data
+            / self.W_dec_H2D.data.norm(dim=-1, keepdim=True)
+            * dec_init_norm
+        )
+        
+        # Initialize encoder as transpose of decoder
+        self.W_enc_2DH = nn.Parameter(torch.empty(2, self.D, self.H, dtype=cfg["dtype"]))
+        self.W_enc_2DH.data[:] = self.W_dec_H2D.permute(1, 2, 0).data
+        
+        self.b_enc_H = nn.Parameter(torch.zeros((self.H,), dtype=cfg["dtype"]))
+        self.b_dec_2D = nn.Parameter(torch.zeros((2, self.D), dtype=cfg["dtype"]))
+        
+        # Dead feature tracking
+        self.num_batches_not_active = torch.zeros(
+            (self.H,), dtype=torch.float32, device=cfg["device"]
+        )
+        
+        # For inference mode threshold estimation
+        self.inference_threshold = None
+        self.threshold_samples = []
+        
+        self.to(cfg["device"])
+    
+    def get_batch_topk_mask(self, x_enc_BH: torch.Tensor) -> torch.Tensor:
+        """Apply BatchTopK: select top k*B activations across entire batch."""
+        B = x_enc_BH.size(0)
+        F_total_batch = x_enc_BH.numel()
+        k_total_batch = min(self.k * B, F_total_batch)
+        
+        x_flat = x_enc_BH.reshape(-1)
+        _, flat_indices = torch.topk(x_flat, k_total_batch, sorted=False)
+        mask_flat = torch.zeros_like(x_flat, dtype=torch.bool)
+        mask_flat[flat_indices] = True
+        return mask_flat.view_as(x_enc_BH)
+    
+    def encode(self, x_B2D: torch.Tensor, inference: bool = False) -> torch.Tensor:
+        """Encode activations from both models into sparse features.
+        
+        Args:
+            x_B2D: Activations of shape (batch, 2, act_size)
+            inference: If True, use threshold-based activation (for deployment)
+        
+        Returns:
+            Sparse features of shape (batch, dict_size)
+        """
+        # Combine both models' activations
+        x_enc_BH = einops.einsum(
+            x_B2D,
+            self.W_enc_2DH,
+            "batch n_models d_model, n_models d_model d_hidden -> batch d_hidden",
+        )
+        # Apply ReLU before topk selection
+        x_enc_BH = F.relu(x_enc_BH + self.b_enc_H)
+        
+        if inference and self.inference_threshold is not None:
+            # Use threshold for inference (JumpReLU-style)
+            acts = x_enc_BH * (x_enc_BH > self.inference_threshold).float()
+        else:
+            # Training: use BatchTopK
+            mask_BH = self.get_batch_topk_mask(x_enc_BH)
+            acts = x_enc_BH * mask_BH
+            
+            # Collect threshold samples for later estimation
+            if self.training and len(self.threshold_samples) < 100:
+                min_positive = acts[acts > 0].min().item() if (acts > 0).any() else 0
+                if min_positive > 0:
+                    self.threshold_samples.append(min_positive)
+        
+        return acts
+    
+    def decode(self, acts_BH: torch.Tensor) -> torch.Tensor:
+        """Decode sparse features back to both models' activation spaces.
+        
+        Args:
+            acts_BH: Sparse features of shape (batch, dict_size)
+            
+        Returns:
+            Reconstructed activations of shape (batch, 2, act_size)
+        """
+        acts_dec_B2D = einops.einsum(
+            acts_BH,
+            self.W_dec_H2D,
+            "batch d_hidden, d_hidden n_models d_model -> batch n_models d_model",
+        )
+        return acts_dec_B2D + self.b_dec_2D
+    
+    def forward(self, x_B2D: torch.Tensor, inference: bool = False) -> torch.Tensor:
+        """Forward pass: encode then decode.
+        
+        Args:
+            x_B2D: Activations of shape (batch, 2, act_size) 
+            inference: If True, use inference mode
+            
+        Returns:
+            Reconstructed activations of shape (batch, 2, act_size)
+        """
+        acts_BH = self.encode(x_B2D, inference=inference)
+        return self.decode(acts_BH)
+    
+    @torch.no_grad()
+    def estimate_inference_threshold(self):
+        """Estimate threshold for inference mode based on training samples."""
+        if len(self.threshold_samples) > 0:
+            self.inference_threshold = torch.tensor(
+                np.mean(self.threshold_samples), 
+                device=self.cfg["device"], 
+                dtype=self.cfg["dtype"]
+            )
+    
+    @torch.no_grad()
+    def update_inactive_features(self, acts_BH: torch.Tensor):
+        """Track which features haven't fired recently."""
+        inactive_H = acts_BH.sum(0) == 0
+        self.num_batches_not_active += inactive_H.float()
+        self.num_batches_not_active[~inactive_H] = 0
+    
+    @torch.no_grad()
+    def make_decoder_weights_and_grad_unit_norm(self):
+        """Normalize decoder weights and project gradients to maintain unit norm."""
+        W_dec_normed = self.W_dec_H2D / self.W_dec_H2D.norm(dim=-1, keepdim=True)
+        
+        if self.W_dec_H2D.grad is not None:
+            W_dec_grad_proj = (self.W_dec_H2D.grad * W_dec_normed).sum(
+                -1, keepdim=True
+            ) * W_dec_normed
+            self.W_dec_H2D.grad -= W_dec_grad_proj
+        
+        self.W_dec_H2D.data = W_dec_normed

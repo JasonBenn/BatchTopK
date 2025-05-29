@@ -16,6 +16,8 @@ try:
     import tempfile
     import json
     import shutil
+    # Add parent directory to path for imports
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from train_crosscoder import CrossCoder, CrossCoderConfig, ActivationsSource, Trainer
 except ImportError as e:
     print(f"Error importing required packages: {e}")
