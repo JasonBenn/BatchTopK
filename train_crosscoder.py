@@ -292,6 +292,10 @@ class CrossCoder(nn.Module):
         self.to(self.cfg.device)
         self.save_dir = None
         self.save_version = 0
+        
+        # For BatchTopK inference mode
+        self.inference_threshold = None
+        self.threshold_samples = []
 
     def get_batch_topk_mask(self, x_enc_BH: torch.Tensor) -> torch.Tensor:
         B = x_enc_BH.size(0)
@@ -306,14 +310,48 @@ class CrossCoder(nn.Module):
         mask_flat[flat_indices] = True
         return mask_flat.view_as(x_enc_BH)
 
-    def encode(self, x_B2D):
+    def encode(self, x_B2D, inference=False, return_pre_acts=False):
         x_enc_BH = einops.einsum(
             x_B2D,
             self.W_enc_2DH,
             "batch n_models d_model, n_models d_model d_hidden -> batch d_hidden",
         )
-        mask_BH = self.get_batch_topk_mask(x_enc_BH)
-        return x_enc_BH * mask_BH + self.b_enc_H
+        # Apply ReLU before topk selection (as per repo implementation)
+        x_enc_BH = F.relu(x_enc_BH + self.b_enc_H)
+        pre_acts = x_enc_BH.clone() if return_pre_acts else None
+        
+        if inference and self.inference_threshold is not None:
+            # Use JumpReLU-style thresholding for inference
+            acts = x_enc_BH * (x_enc_BH > self.inference_threshold).float()
+        else:
+            # Training mode: use BatchTopK
+            mask_BH = self.get_batch_topk_mask(x_enc_BH)
+            acts = x_enc_BH * mask_BH
+            
+            # Collect threshold samples during training for later estimation
+            if self.training and len(self.threshold_samples) < 100:
+                min_positive = acts[acts > 0].min().item() if (acts > 0).any() else 0
+                if min_positive > 0:
+                    self.threshold_samples.append(min_positive)
+        
+        if return_pre_acts:
+            return acts, pre_acts
+        else:
+            return acts
+    
+    @torch.no_grad()
+    def estimate_inference_threshold(self):
+        """Estimate threshold for inference mode as per BatchTopK paper."""
+        if len(self.threshold_samples) > 0:
+            self.inference_threshold = torch.tensor(
+                np.mean(self.threshold_samples), 
+                device=self.cfg.device, 
+                dtype=self.dtype
+            )
+            print(f"Estimated inference threshold: {self.inference_threshold.item():.6f}")
+        else:
+            print("Warning: No threshold samples collected, using default threshold")
+            self.inference_threshold = torch.tensor(0.0, device=self.cfg.device, dtype=self.dtype)
 
     def get_features(self, x_BD: torch.Tensor, model_idx: int = 1) -> torch.Tensor:
         with torch.no_grad():
@@ -333,13 +371,13 @@ class CrossCoder(nn.Module):
         )
         return acts_dec_B2D + self.b_dec_2D
 
-    def forward(self, x_B2D):
-        acts_BH = self.encode(x_B2D)
+    def forward(self, x_B2D, inference=False):
+        acts_BH = self.encode(x_B2D, inference=inference)
         return self.decode(acts_BH)
 
     def get_losses(self, x_B2D):
         x_B2D = x_B2D.to(self.dtype)
-        acts_BH = self.encode(x_B2D)
+        acts_BH, pre_acts_BH = self.encode(x_B2D, return_pre_acts=True)
         x_reconstruct_B2D = self.decode(acts_BH)
 
         # Dead-neuron bookkeeping
@@ -371,7 +409,7 @@ class CrossCoder(nn.Module):
         )
         explained_variance_B = 1 - per_token_l2_loss_B / (total_variance_B + 1e-8)
 
-        aux_loss = self.get_auxiliary_loss(x_B2D, x_reconstruct_B2D, acts_BH)
+        aux_loss = self.get_auxiliary_loss(x_B2D, x_reconstruct_B2D, pre_acts_BH)
         total_loss = mse_loss + self.cfg.aux_loss_coeff * aux_loss
 
         num_dead = (self.num_batches_not_active > self.cfg.n_batches_to_dead).sum()
@@ -397,11 +435,31 @@ class CrossCoder(nn.Module):
         self.num_batches_not_active += inactive_H.float()
         self.num_batches_not_active[~inactive_H] = 0
 
-    def get_auxiliary_loss(self, x_B2D, x_reconstruct_B2D, acts_BH):
+    @torch.no_grad()
+    def make_decoder_weights_and_grad_unit_norm(self):
+        """
+        Normalize decoder weights to unit norm and project gradients to maintain unit norm.
+        This is called after each training step.
+        """
+        # W_dec_H2D has shape (H, 2, D)
+        # Normalize along the D dimension for each model
+        W_dec_normed = self.W_dec_H2D / self.W_dec_H2D.norm(dim=-1, keepdim=True)
+        
+        # Project gradients to maintain unit norm constraint
+        if self.W_dec_H2D.grad is not None:
+            W_dec_grad_proj = (self.W_dec_H2D.grad * W_dec_normed).sum(
+                -1, keepdim=True
+            ) * W_dec_normed
+            self.W_dec_H2D.grad -= W_dec_grad_proj
+        
+        # Update weights to normalized version
+        self.W_dec_H2D.data = W_dec_normed
+
+    def get_auxiliary_loss(self, x_B2D, x_reconstruct_B2D, pre_acts_BH):
         """
         Encourage currently-dead units to explain the residual.
         x_B2D, x_reconstruct_B2D: (B, 2, D)
-        acts_BH: (B, H)
+        pre_acts_BH: (B, H) - pre-topk activations (as per repo implementation)
         """
         dead_mask_H = self.num_batches_not_active >= self.cfg.n_batches_to_dead  # (H,)
         n_dead = dead_mask_H.sum().item()
@@ -411,8 +469,8 @@ class CrossCoder(nn.Module):
         # Residual still left over after normal reconstruction
         residual_B2D = x_B2D.float() - x_reconstruct_B2D.float()  # (B, 2, D)
 
-        # Select top-k activations for *dead* units only
-        acts_dead_BH = acts_BH[:, dead_mask_H]  # (B, H_dead)
+        # Select top-k activations for *dead* units only from PRE-TOPK activations
+        acts_dead_BH = pre_acts_BH[:, dead_mask_H]  # (B, H_dead)
         if acts_dead_BH.shape[1] == 0:
             return torch.zeros((), device=x_B2D.device, dtype=x_B2D.dtype)
         k_aux = min(self.cfg.top_k_aux, acts_dead_BH.shape[1])
@@ -458,7 +516,13 @@ class CrossCoder(nn.Module):
         weight_path = self.save_dir / f"{self.save_version}.pt"
         cfg_path = self.save_dir / f"{self.save_version}_cfg.json"
 
-        torch.save(self.state_dict(), weight_path)
+        # Save model state and additional info
+        save_dict = {
+            'state_dict': self.state_dict(),
+            'inference_threshold': self.inference_threshold,
+            'threshold_samples': self.threshold_samples
+        }
+        torch.save(save_dict, weight_path)
         with open(cfg_path, "w") as f:
             json.dump(self.cfg.model_dump(), f)
 
@@ -480,7 +544,17 @@ class CrossCoder(nn.Module):
         self = cls(
             cfg=CrossCoderConfig(**{**cfg_dict, **{"device": device}}),
         )
-        self.load_state_dict(torch.load(weight_path, map_location=device))
+        
+        # Load saved data
+        checkpoint = torch.load(weight_path, map_location=device)
+        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+            self.load_state_dict(checkpoint['state_dict'])
+            self.inference_threshold = checkpoint.get('inference_threshold', None)
+            self.threshold_samples = checkpoint.get('threshold_samples', [])
+        else:
+            # Backward compatibility with old format
+            self.load_state_dict(checkpoint)
+        
         return self
 
 
@@ -551,6 +625,8 @@ class Trainer:
 
         losses.total_loss.backward()
         clip_grad_norm_(self.crosscoder.parameters(), max_norm=1.0)
+        # Normalize decoder weights and project gradients before optimizer step
+        self.crosscoder.make_decoder_weights_and_grad_unit_norm()
         self.optimizer.step()
         self.scheduler.step()
         self.optimizer.zero_grad()
@@ -584,6 +660,8 @@ class Trainer:
                 if (i + 1) % self.cfg.save_every == 0:
                     self.save()
         finally:
+            # Estimate inference threshold before final save
+            self.crosscoder.estimate_inference_threshold()
             self.save()
 
 
